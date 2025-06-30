@@ -1,0 +1,4 @@
+2025-06-29 19:37:12,019 - INFO - Epoch 1 Train Loss: 0.1645, Accuracy: 0.9271
+2025-06-29 19:38:04,590 - INFO - Epoch 1 Val Loss: 0.0469, Accuracy: 0.9836
+2025-06-29 19:40:16,744 - INFO - Epoch 2 Train Loss: 0.1294, Accuracy: 0.9434
+2025-06-29 19:40:42,617 - INFO - Epoch 2 Val Loss: 0.0282, Accuracy: 0.9892
