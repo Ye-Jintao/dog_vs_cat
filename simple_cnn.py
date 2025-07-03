@@ -1,14 +1,3 @@
-# Deleted:import torch
-# Deleted:import torch.nn as nn
-# Deleted:import torch.optim as optim
-# Deleted:from torchvision import datasets, transforms, models
-# Deleted:from torch.utils.data import DataLoader, Dataset
-# Deleted:from PIL import Image
-# Deleted:import os
-# Deleted:import matplotlib.pyplot as plt
-# Deleted:import numpy as np
-# Deleted:from tqdm import tqdm
-
 import torch
 import torch.nn as nn
 import torch.optim as optim

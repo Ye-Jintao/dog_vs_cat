@@ -1,0 +1,1 @@
+2025-06-30 14:14:16,108 - INFO - Epoch 1 Train Loss: 0.6446, Accuracy: 0.6357

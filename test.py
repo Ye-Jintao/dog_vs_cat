@@ -6,11 +6,14 @@ from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel,
                              QPushButton, QFileDialog, QVBoxLayout,
                              QWidget, QHBoxLayout, QMessageBox)
-from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont
+from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QImage
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from matplotlib.figure import Figure
+import numpy as np
+import cv2
 
-
-# 定义模型结构（与 resnet18_with_cbam.py 相同）
+# CBAM模块（带注意力权重输出）
 class CBAM(nn.Module):
     def __init__(self, channels, reduction_ratio=8):
         super(CBAM, self).__init__()
@@ -30,18 +33,20 @@ class CBAM(nn.Module):
         )
 
     def forward(self, x):
+        # 通道注意力
         channel_att = self.channel_attention(x)
         x_channel = x * channel_att
 
+        # 空间注意力
         avg_out = torch.mean(x_channel, dim=1, keepdim=True)
         max_out, _ = torch.max(x_channel, dim=1, keepdim=True)
         spatial_att = self.spatial_attention(torch.cat([avg_out, max_out], dim=1))
         x_spatial = x_channel * spatial_att
 
-        return x_spatial
+        return x_spatial, channel_att, spatial_att  # 返回注意力权重
 
 
-# 实现 BasicBlock（ResNet-18/34 使用）
+# BasicBlock实现
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -73,7 +78,7 @@ class BasicBlock(nn.Module):
         return out
 
 
-# 带CBAM的 ResNet-18
+# 带注意力机制的 ResNet-18 模型
 class ResNet18WithCBAM(nn.Module):
     def __init__(self, num_classes=1):
         super(ResNet18WithCBAM, self).__init__()
@@ -86,15 +91,12 @@ class ResNet18WithCBAM(nn.Module):
 
         self.layer1 = self._make_layer(64, 64, blocks=2, stride=1)
 
-        # 在layer2之后添加CBAM模块
         self.cbam1 = CBAM(64 * BasicBlock.expansion)
         self.layer2 = self._make_layer(64, 128, blocks=2, stride=2)
 
-        # 在layer3之后添加CBAM模块
         self.cbam2 = CBAM(128 * BasicBlock.expansion)
         self.layer3 = self._make_layer(128, 256, blocks=2, stride=2)
 
-        # 在layer4之前添加CBAM模块
         self.cbam3 = CBAM(256 * BasicBlock.expansion)
         self.layer4 = self._make_layer(256, 512, blocks=2, stride=2)
 
@@ -131,13 +133,13 @@ class ResNet18WithCBAM(nn.Module):
         x = self.maxpool(x)
 
         x = self.layer1(x)
-        x = self.cbam1(x)  # 添加CBAM模块
+        x, channel_att1, spatial_att1 = self.cbam1(x)
 
         x = self.layer2(x)
-        x = self.cbam2(x)  # 添加CBAM模块
+        x, channel_att2, spatial_att2 = self.cbam2(x)
 
         x = self.layer3(x)
-        x = self.cbam3(x)  # 添加CBAM模块
+        x, channel_att3, spatial_att3 = self.cbam3(x)
 
         x = self.layer4(x)
 
@@ -145,7 +147,10 @@ class ResNet18WithCBAM(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
 
-        return x
+        return x, {
+            'channel': [channel_att1, channel_att2, channel_att3],
+            'spatial': [spatial_att1, spatial_att2, spatial_att3]
+        }
 
 
 # 图像预处理
@@ -156,9 +161,9 @@ transform = transforms.Compose([
 ])
 
 
-# 预测线程
+# 预测线程（含注意力图）
 class PredictionThread(QThread):
-    prediction_done = pyqtSignal(str, float, float)
+    prediction_done = pyqtSignal(str, float, float, dict)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, model, device, image_path):
@@ -169,18 +174,16 @@ class PredictionThread(QThread):
 
     def run(self):
         try:
-            # 加载并预处理图片
             image = Image.open(self.image_path).convert('RGB')
             image_tensor = transform(image).unsqueeze(0).to(self.device)
 
-            # 预测
             with torch.no_grad():
-                output = self.model(image_tensor)
+                output, attentions = self.model(image_tensor)
                 probability = output.item()
                 prediction = "狗" if probability > 0.5 else "猫"
                 confidence = probability if prediction == "狗" else 1 - probability
 
-            self.prediction_done.emit(prediction, confidence, probability)
+            self.prediction_done.emit(prediction, confidence, probability, attentions)
         except Exception as e:
             self.error_occurred.emit(str(e))
 
@@ -189,11 +192,11 @@ class CatDogApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("猫狗分类器")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 800, 650)
 
         # 加载模型
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = ResNet18WithCBAM().to(self.device)  # 修改为 ResNet18WithCBAM
+        self.model = ResNet18WithCBAM().to(self.device)
         try:
             self.model.load_state_dict(torch.load('resnet18_CBAM.pth', map_location=self.device))
             self.model.eval()
@@ -206,7 +209,6 @@ class CatDogApp(QMainWindow):
         self.prediction_thread = None
 
     def initUI(self):
-        # 主部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout()
@@ -216,6 +218,12 @@ class CatDogApp(QMainWindow):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("border: 2px solid black;")
         layout.addWidget(self.image_label)
+
+        # 注意力图显示区域
+        self.attn_label = QLabel("注意力热力图")
+        self.attn_label.setAlignment(Qt.AlignCenter)
+        self.attn_label.setStyleSheet("border: 1px solid gray;")
+        layout.addWidget(self.attn_label)
 
         # 结果标签
         self.result_label = QLabel("请选择一张图片进行分类")
@@ -242,21 +250,14 @@ class CatDogApp(QMainWindow):
         central_widget.setLayout(layout)
 
     def load_image(self):
-        # 打开文件对话框选择图片
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", "图片文件 (*.jpg *.jpeg *.png)"
-        )
-
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片文件 (*.jpg *.jpeg *.png)")
         if file_path:
-            # 显示图片
             try:
                 pixmap = QPixmap(file_path)
                 if pixmap.isNull():
                     raise ValueError("无法加载图片文件")
 
-                scaled_pixmap = pixmap.scaled(
-                    600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
+                scaled_pixmap = pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.image_label.setPixmap(scaled_pixmap)
                 self.current_image_path = file_path
                 self.result_label.setText("图片已加载，点击'分类'按钮进行预测")
@@ -266,62 +267,105 @@ class CatDogApp(QMainWindow):
 
     def classify_image(self):
         if hasattr(self, 'current_image_path'):
-            # 禁用按钮避免重复点击
             self.classify_button.setEnabled(False)
             self.load_button.setEnabled(False)
             self.result_label.setText("正在分类中，请稍候...")
 
-            # 创建并启动预测线程
-            self.prediction_thread = PredictionThread(
-                self.model, self.device, self.current_image_path
-            )
+            self.prediction_thread = PredictionThread(self.model, self.device, self.current_image_path)
             self.prediction_thread.prediction_done.connect(self.on_prediction_done)
             self.prediction_thread.error_occurred.connect(self.on_prediction_error)
             self.prediction_thread.finished.connect(self.on_thread_finished)
             self.prediction_thread.start()
 
-    def on_prediction_done(self, prediction, confidence, probability):
-        # 显示结果
+    def on_prediction_done(self, prediction, confidence, probability, attentions):
         self.result_label.setText(
             f"预测结果: {prediction} (置信度: {confidence * 100:.2f}%)\n"
             f"原始输出值: {probability:.4f}"
         )
 
-        # 在图片上显示结果
-        pixmap = self.image_label.pixmap()
-        new_pixmap = pixmap.copy()
-        painter = QPainter(new_pixmap)
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Arial", 20))
-        painter.drawText(
-            20, 40,
-            f"{prediction} {confidence * 100:.1f}%"
-        )
-        painter.end()
-        self.image_label.setPixmap(new_pixmap)
+        # 加载原始图像
+        original_image = cv2.imread(self.current_image_path)
+        if original_image is None:
+            self.result_label.setText("错误: 无法加载原始图像")
+            return
+        original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        original_image = cv2.resize(original_image, (224, 224))
+
+        # 获取最后一个空间注意力图
+        spatial_attn_map = attentions['spatial'][-1].squeeze().cpu().numpy()
+        print(
+            f"Spatial Attention Map Shape: {spatial_attn_map.shape}, Min: {spatial_attn_map.min()}, Max: {spatial_attn_map.max()}")
+
+        # 检查注意力图尺寸
+        if spatial_attn_map.shape[0] == 0 or spatial_attn_map.shape[1] == 0:
+            self.result_label.setText("错误: 注意力图尺寸无效")
+            return
+
+        # 应用阈值以突出高注意力区域
+        threshold = np.percentile(spatial_attn_map, 75)
+        spatial_attn_map = np.clip(spatial_attn_map, threshold, spatial_attn_map.max())
+        spatial_attn_map = (spatial_attn_map - spatial_attn_map.min()) / (
+                    spatial_attn_map.max() - spatial_attn_map.min() + 1e-8)
+
+        # 调整注意力图大小以匹配原始图像
+        try:
+            heatmap = cv2.resize(spatial_attn_map, (224, 224), interpolation=cv2.INTER_LINEAR)
+            alpha_map = cv2.resize(spatial_attn_map, (224, 224), interpolation=cv2.INTER_LINEAR)  # Resize alpha_map
+            alpha_map = alpha_map * 0.6  # Apply transparency factor
+            alpha_map = np.stack([alpha_map] * 3, axis=-1)  # Add channel dimension to match (224, 224, 3)
+        except Exception as e:
+            self.result_label.setText(f"错误: 调整注意力图大小失败: {str(e)}")
+            return
+
+        heatmap = np.uint8(255 * heatmap)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+        # 动态透明度叠加
+        try:
+            overlaid_image = (alpha_map * heatmap + (1 - alpha_map) * original_image).astype(np.uint8)
+        except Exception as e:
+            self.result_label.setText(f"错误: 图像叠加失败: {str(e)}")
+            return
+
+        # 转换为QImage
+        height, width, channel = overlaid_image.shape
+        bytes_per_line = width * channel
+        try:
+            qimg = QImage(overlaid_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
+            if qimg.isNull():
+                self.result_label.setText("错误: 无法创建QImage")
+                return
+            pixmap = QPixmap.fromImage(qimg).scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.attn_label.setPixmap(pixmap)
+        except Exception as e:
+            self.result_label.setText(f"错误: QImage转换失败: {str(e)}")
+            return
+
+        # 保存所有层的注意力图用于调试
+        for i, spatial_att in enumerate(attentions['spatial']):
+            spatial_map = spatial_att.squeeze().cpu().numpy()
+            spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
+            heatmap = cv2.resize(spatial_map, (224, 224), interpolation=cv2.INTER_LINEAR)
+            heatmap = np.uint8(255 * heatmap)
+            heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+            cv2.imwrite(f"spatial_attention_layer_{i + 1}.png", heatmap)
 
     def on_prediction_error(self, error_msg):
         QMessageBox.warning(self, "预测错误", f"分类过程中发生错误:\n{error_msg}")
         self.result_label.setText("分类失败，请重试")
 
     def on_thread_finished(self):
-        # 重新启用按钮
         self.classify_button.setEnabled(True)
         self.load_button.setEnabled(True)
-
-        # 清理线程
         self.prediction_thread = None
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
-    # 设置全局样式
     app.setStyle("Fusion")
-
     window = CatDogApp()
     window.show()
-
     try:
         sys.exit(app.exec_())
     except Exception as e:
